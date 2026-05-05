@@ -5,8 +5,12 @@ from textblob import TextBlob
 from sklearn.linear_model import LogisticRegression
 import numpy as np
 
-# ---------- CONFIG ----------
-st.set_page_config(page_title="Ron's Earnings Terminal", layout="wide")
+# -------------------------------
+# Load API key from Streamlit Cloud secrets
+api_key = st.secrets["mp"]["api_key"]
+# -------------------------------
+
+st.set_page_config(page_title="Ron's Earnings Terminal")
 
 # ---------- API ----------
 def fmp_get(url):
@@ -17,7 +21,7 @@ def fmp_get(url):
 
 # ---------- CORE HELPERS ----------
 def get_next_earnings_date(ticker, api_key):
-    url = f"https://financialmodelingprep.com/api/v3/earning_calendar?symbol={ticker}&limit=1&apikey={api_key}"
+    url = f"https://financialmodelingprep.com/api/v3/earnings_calendar/{ticker}?apikey={api_key}"
     data = fmp_get(url)
     if not data:
         return None
@@ -25,7 +29,6 @@ def get_next_earnings_date(ticker, api_key):
 
 def get_implied_move(ticker, api_key):
     earn_date = get_next_earnings_date(ticker, api_key)
-
     url = f"https://financialmodelingprep.com/api/v3/options/{ticker}?apikey={api_key}"
     data = fmp_get(url)
     if not data:
@@ -115,11 +118,9 @@ def get_post_earnings_moves_simple(ticker, api_key, limit=10):
     rows = []
     for e in data:
         d0 = pd.to_datetime(e["date"]).date()
-        d1 = d0 + pd.Timedelta(days=1)
         prices = get_price_history(ticker, api_key, days=5)
         if prices.empty:
             continue
-        # approximate: use closest dates
         try:
             p0 = prices.iloc[-2]["close"]
             p1 = prices.iloc[-1]["close"]
@@ -129,9 +130,8 @@ def get_post_earnings_moves_simple(ticker, api_key, limit=10):
         rows.append({"date": d0, "post_earnings_move_pct": move})
     return pd.DataFrame(rows)
 
-# ---------- MODEL (very simple placeholder) ----------
+# ---------- MODEL ----------
 def train_dummy_model():
-    # tiny fake dataset just to get probabilities working
     X = np.array([
         [0.05,  0.2,  0.1],
         [0.03, -0.3, -0.2],
@@ -139,14 +139,14 @@ def train_dummy_model():
         [0.07,  0.4,  0.3],
         [0.01, -0.2, -0.1],
     ])
-    y = np.array([1, 0, 0, 1, 0])  # 1 = beat/up, 0 = miss/down
+    y = np.array([1, 0, 0, 1, 0])
     clf = LogisticRegression()
     clf.fit(X, y)
     return clf
 
 def predict_direction(clf, implied_move, sentiment, hist_move):
     x = np.array([[implied_move or 0.0, sentiment, hist_move or 0.0]])
-    prob = clf.predict_proba(x)[0, 1]  # prob of "up"
+    prob = clf.predict_proba(x)[0, 1]
     return prob
 
 # ---------- UI ----------
@@ -154,10 +154,7 @@ def main():
     st.title("Ron's Earnings Terminal")
 
     st.sidebar.header("Settings")
-    api_key = st.sidebar.text_input("FMP API Key", type="password")
-    if not api_key:
-        st.warning("Enter your FMP API key in the sidebar to start.")
-        return
+    st.sidebar.success("API key loaded from Streamlit Cloud.")
 
     if "clf" not in st.session_state:
         st.session_state["clf"] = train_dummy_model()
