@@ -34,136 +34,42 @@ def get_next_earnings_date(ticker, api_key):
         return None
     return pd.to_datetime(data[0]["date"]).date()
 
+def get_price_history(ticker, api_key, days=120):
+    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?timeseries={days}&apikey={api_key}"
+    data = fmp_get(url)
+    if not data or "historical" not in data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data["historical"])
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    return df
+
 def get_implied_move(ticker, api_key):
     """
-    Advanced multi-strike implied move using FMP v4 options chain.
-    - Pulls full chain
-    - Picks expiration around earnings
-    - Uses multiple near-the-money strikes to stabilize the estimate
+    Fallback 'implied move' using realized volatility from recent price history.
+    - Uses last 30 trading days of returns
+    - Computes daily volatility
+    - Uses that as a proxy for 1-day expected move
     """
-    earn_date = get_next_earnings_date(ticker, api_key)
-
-    url = f"https://financialmodelingprep.com/api/v4/options/chain?symbol={ticker}&apikey={api_key}"
-    data = fmp_get(url)
-    if not data:
+    prices = get_price_history(ticker, api_key, days=60)
+    if prices.empty:
         return None, None
 
-    df = pd.DataFrame(data)
-    if df.empty:
-        return None, None
+    closes = prices["close"].astype(float)
+    if len(closes) < 10:
+        return None, float(closes.iloc[-1])
 
-    # Try to get stock price from payload
-    stock_price = None
-    if "stockPrice" in df.columns:
-        try:
-            stock_price = float(df["stockPrice"].dropna().iloc[0])
-        except Exception:
-            stock_price = None
+    rets = closes.pct_change().dropna()
+    if rets.empty:
+        return None, float(closes.iloc[-1])
 
-    if stock_price is None:
-        return None, None
+    # Realized daily volatility
+    vol = rets.tail(30).std()
+    spot = float(closes.iloc[-1])
 
-    # Clean and parse expiration
-    if "expirationDate" not in df.columns:
-        return None, None
-
-    df["expirationDate"] = pd.to_datetime(df["expirationDate"]).dt.date
-
-    # Choose expiration closest AFTER earnings if possible
-    if earn_date:
-        after = df[df["expirationDate"] >= earn_date]
-        if not after.empty:
-            target_exp = after["expirationDate"].min()
-        else:
-            # fallback: closest in absolute time
-            df["diff"] = (pd.to_datetime(df["expirationDate"]) - pd.to_datetime(earn_date)).abs()
-            target_exp = df.loc[df["diff"].idxmin(), "expirationDate"]
-    else:
-        target_exp = df["expirationDate"].min()
-
-    chain = df[df["expirationDate"] == target_exp].copy()
-    if chain.empty:
-        return None, None
-
-    # Normalize option type column name
-    opt_col = None
-    for c in chain.columns:
-        if c.lower() in ["optiontype", "type", "side"]:
-            opt_col = c
-            break
-    if opt_col is None:
-        return None, None
-
-    # Separate calls/puts
-    calls = chain[chain[opt_col].str.upper().isin(["CALL", "C"])]
-    puts  = chain[chain[opt_col].str.upper().isin(["PUT", "P"])]
-    if calls.empty or puts.empty:
-        return None, None
-
-    # Focus on strikes near the money (within ±10%)
-    calls = calls.copy()
-    puts = puts.copy()
-    calls = calls[(calls["strike"] > 0) & (calls["strike"].between(0.9*stock_price, 1.1*stock_price))]
-    puts  = puts[(puts["strike"] > 0) & (puts["strike"].between(0.9*stock_price, 1.1*stock_price))]
-    if calls.empty or puts.empty:
-        return None, None
-
-    def mid_series(df_part):
-        bid_col = None
-        ask_col = None
-        last_col = None
-        for c in df_part.columns:
-            cl = c.lower()
-            if cl == "bid":
-                bid_col = c
-            elif cl == "ask":
-                ask_col = c
-            elif cl in ["last", "lastprice"]:
-                last_col = c
-
-        mids = []
-        for _, row in df_part.iterrows():
-            bid = row.get(bid_col) if bid_col else None
-            ask = row.get(ask_col) if ask_col else None
-            last = row.get(last_col) if last_col else None
-            val = 0.0
-            try:
-                if pd.notna(bid) and pd.notna(ask) and bid > 0 and ask > 0:
-                    val = (bid + ask) / 2
-                elif pd.notna(last) and last > 0:
-                    val = last
-            except Exception:
-                pass
-            mids.append(val)
-        return np.array(mids)
-
-    call_mids = mid_series(calls)
-    put_mids  = mid_series(puts)
-
-    if call_mids.size == 0 or put_mids.size == 0:
-        return None, None
-
-    # Match calls/puts by closest strike
-    call_strikes = calls["strike"].values
-    put_strikes  = puts["strike"].values
-
-    pairs = []
-    for i, cs in enumerate(call_strikes):
-        j = np.argmin(np.abs(put_strikes - cs))
-        pairs.append((cs, call_mids[i], put_mids[j]))
-
-    if not pairs:
-        return None, None
-
-    # Use multiple near-the-money pairs to stabilize estimate
-    pairs = sorted(pairs, key=lambda x: abs(x[0] - stock_price))
-    top_pairs = pairs[:5]  # up to 5 closest strikes
-
-    straddle_costs = [(c + p) for _, c, p in top_pairs]
-    avg_straddle = np.mean(straddle_costs)
-
-    implied_move = avg_straddle / stock_price
-    return float(implied_move), float(stock_price)
+    # Treat this as a 1-day "implied move" proxy
+    implied_move = float(vol)
+    return implied_move, spot
 
 def get_simple_sentiment(ticker, api_key, limit=20):
     url = f"https://financialmodelingprep.com/api/v3/stock_news?tickers={ticker}&limit={limit}&apikey={api_key}"
@@ -180,16 +86,6 @@ def get_simple_sentiment(ticker, api_key, limit=20):
     if not scores:
         return 0.0
     return float(np.mean(scores))
-
-def get_price_history(ticker, api_key, days=60):
-    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?timeseries={days}&apikey={api_key}"
-    data = fmp_get(url)
-    if not data or "historical" not in data:
-        return pd.DataFrame()
-    df = pd.DataFrame(data["historical"])
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.set_index("date").sort_index()
-    return df
 
 def get_post_earnings_moves_simple(ticker, api_key, limit=10):
     url = f"https://financialmodelingprep.com/api/v3/historical/earning_calendar/{ticker}?limit={limit}&apikey={api_key}"
@@ -259,7 +155,7 @@ def main():
             ticker = st.text_input("Ticker", value="AAPL").upper().strip()
             run = st.button("Run Prediction")
         with col_info:
-            st.markdown("**Tip:** Try liquid names with active options (AAPL, MSFT, AMZN, NVDA, TSLA).")
+            st.markdown("**Tip:** Try liquid names (AAPL, MSFT, AMZN, NVDA, TSLA).")
 
         if run and ticker:
             implied_move, spot = get_implied_move(ticker, api_key)
@@ -282,7 +178,7 @@ def main():
                 st.metric("Avg Past 1D Move", f"{hist_move*100:.2f}%")
 
             if implied_move is None or spot is None:
-                st.warning("No usable options data for this ticker/expiration. Try another symbol.")
+                st.warning("Not enough price history to estimate volatility for this ticker.")
             else:
                 if predicted_move > 0.01:
                     st.success("📈 **UP bias into earnings**")
