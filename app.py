@@ -10,18 +10,25 @@ import numpy as np
 api_key = st.secrets["mp"]["api_key"]
 # -------------------------------
 
-st.set_page_config(page_title="Ron's Earnings Terminal")
+st.set_page_config(
+    page_title="Ron's Earnings Terminal",
+    page_icon="📊",
+    layout="wide"
+)
 
 # ---------- API ----------
 def fmp_get(url):
-    r = requests.get(url)
-    if r.status_code != 200:
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
         return None
-    return r.json()
 
 # ---------- CORE HELPERS ----------
 def get_next_earnings_date(ticker, api_key):
-    url = f"https://financialmodelingprep.com/api/v3/earnings_calendar/{ticker}?apikey={api_key}"
+    url = f"https://financialmodelingprep.com/api/v3/earning_calendar?symbol={ticker}&limit=1&apikey={api_key}"
     data = fmp_get(url)
     if not data:
         return None
@@ -116,18 +123,19 @@ def get_post_earnings_moves_simple(ticker, api_key, limit=10):
     if not data:
         return pd.DataFrame()
     rows = []
+    prices = get_price_history(ticker, api_key, days=60)
+    if prices.empty:
+        return pd.DataFrame()
     for e in data:
-        d0 = pd.to_datetime(e["date"]).date()
-        prices = get_price_history(ticker, api_key, days=5)
-        if prices.empty:
-            continue
+        d0 = pd.to_datetime(e["date"])
+        d1 = d0 + pd.Timedelta(days=1)
         try:
-            p0 = prices.iloc[-2]["close"]
-            p1 = prices.iloc[-1]["close"]
-        except:
+            p0 = prices.loc[:d0].iloc[-1]["close"]
+            p1 = prices.loc[:d1].iloc[-1]["close"]
+        except Exception:
             continue
         move = (p1 - p0) / p0
-        rows.append({"date": d0, "post_earnings_move_pct": move})
+        rows.append({"date": d0.date(), "post_earnings_move_pct": move})
     return pd.DataFrame(rows)
 
 # ---------- MODEL ----------
@@ -151,26 +159,33 @@ def predict_direction(clf, implied_move, sentiment, hist_move):
 
 # ---------- UI ----------
 def main():
-    st.title("Ron's Earnings Terminal")
+    st.markdown(
+        "<h1 style='text-align: center;'>Ron's Earnings Terminal</h1>",
+        unsafe_allow_html=True,
+    )
 
-    st.sidebar.header("Settings")
-    st.sidebar.success("API key loaded from Streamlit Cloud.")
-
-    if "clf" not in st.session_state:
-        st.session_state["clf"] = train_dummy_model()
-
-    if st.sidebar.button("Reset model"):
-        st.session_state["clf"] = train_dummy_model()
-        st.success("Model reset.")
+    with st.sidebar:
+        st.header("Settings")
+        st.success("API key loaded from Streamlit Cloud.")
+        if "clf" not in st.session_state:
+            st.session_state["clf"] = train_dummy_model()
+        if st.button("Reset model"):
+            st.session_state["clf"] = train_dummy_model()
+            st.success("Model reset.")
 
     tab1, tab2, tab3 = st.tabs(["🔮 Predict", "📈 Backtest", "🛰 Scanner"])
 
     # ---------- PREDICT TAB ----------
     with tab1:
         st.subheader("Next Earnings Move")
+        col_in, col_info = st.columns([2, 1])
+        with col_in:
+            ticker = st.text_input("Ticker", value="AAPL").upper().strip()
+            run = st.button("Run Prediction")
+        with col_info:
+            st.markdown("**Tip:** Try liquid names with active options (AAPL, MSFT, AMZN, NVDA, etc.).")
 
-        ticker = st.text_input("Ticker", value="AAPL").upper().strip()
-        if st.button("Run Prediction"):
+        if run and ticker:
             implied_move, spot = get_implied_move(ticker, api_key)
             sentiment = get_simple_sentiment(ticker, api_key, limit=20)
             hist_df = get_post_earnings_moves_simple(ticker, api_key, limit=5)
@@ -180,20 +195,22 @@ def main():
             up_prob = predict_direction(clf, implied_move, sentiment, hist_move)
             predicted_move = (implied_move or 0.0) * (2 * up_prob - 1)
 
-            col1, col2, col3 = st.columns(3)
-            with col1:
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("Spot", f"{spot:.2f}" if spot else "N/A")
+            with m2:
                 st.metric("Implied Move (±%)", f"{(implied_move or 0.0)*100:.2f}")
-            with col2:
+            with m3:
                 st.metric("Up Probability", f"{up_prob*100:.1f}%")
-            with col3:
+            with m4:
                 st.metric("Avg Past 1D Move", f"{hist_move*100:.2f}%")
 
             if predicted_move > 0.01:
-                st.success("📈 **UP**")
+                st.success("📈 **UP bias into earnings**")
             elif predicted_move < -0.01:
-                st.error("📉 **DOWN**")
+                st.error("📉 **DOWN bias into earnings**")
             else:
-                st.info("⚪ **FLAT**")
+                st.info("⚪ **FLAT / uncertain**")
 
             with st.expander("News Sentiment (raw)"):
                 st.write(f"Sentiment score: {sentiment:.3f}")
@@ -205,8 +222,13 @@ def main():
     # ---------- BACKTEST TAB ----------
     with tab2:
         st.subheader("Historical Implied vs Actual (simple view)")
-        ticker_bt = st.text_input("Backtest Ticker", value="AAPL", key="bt_ticker").upper().strip()
-        if st.button("Run Backtest"):
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            ticker_bt = st.text_input("Backtest Ticker", value="AAPL", key="bt_ticker").upper().strip()
+        with c2:
+            run_bt = st.button("Run Backtest")
+
+        if run_bt and ticker_bt:
             hist_df = get_post_earnings_moves_simple(ticker_bt, api_key, limit=10)
             if hist_df.empty:
                 st.warning("No historical earnings data.")
@@ -224,7 +246,8 @@ def main():
             ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA"],
             default=["AAPL", "MSFT", "AMZN"],
         )
-        if st.button("Run Scan"):
+        run_scan = st.button("Run Scan")
+        if run_scan and universe:
             rows = []
             for t in universe:
                 implied_move, spot = get_implied_move(t, api_key)
