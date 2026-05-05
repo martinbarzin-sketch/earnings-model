@@ -35,39 +35,49 @@ def get_next_earnings_date(ticker, api_key):
     return pd.to_datetime(data[0]["date"]).date()
 
 def get_price_history(ticker, api_key, days=120):
-    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?timeseries={days}&apikey={api_key}"
+    # Use full history, then trim locally to avoid FMP quirks
+    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?apikey={api_key}"
     data = fmp_get(url)
     if not data or "historical" not in data:
         return pd.DataFrame()
     df = pd.DataFrame(data["historical"])
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date").sort_index()
-    return df
+    return df.tail(days)
 
 def get_implied_move(ticker, api_key):
     """
-    Fallback 'implied move' using realized volatility from recent price history.
-    - Uses last 30 trading days of returns
-    - Computes daily volatility
-    - Uses that as a proxy for 1-day expected move
+    Moderate regime:
+    - 20-day realized volatility
+    - If earnings is within ~7 days, boost vol moderately
     """
-    prices = get_price_history(ticker, api_key, days=60)
+    prices = get_price_history(ticker, api_key, days=120)
     if prices.empty:
         return None, None
 
     closes = prices["close"].astype(float)
-    if len(closes) < 10:
+    if len(closes) < 20:
         return None, float(closes.iloc[-1])
 
     rets = closes.pct_change().dropna()
     if rets.empty:
         return None, float(closes.iloc[-1])
 
-    # Realized daily volatility
-    vol = rets.tail(30).std()
+    base_vol = rets.tail(20).std()  # daily realized vol
     spot = float(closes.iloc[-1])
 
-    # Treat this as a 1-day "implied move" proxy
+    # Earnings proximity boost
+    earn_date = get_next_earnings_date(ticker, api_key)
+    if earn_date is not None:
+        last_date = prices.index[-1].date()
+        days_to_earn = (earn_date - last_date).days
+        if 0 <= days_to_earn <= 7:
+            vol = base_vol * 1.5  # moderate boost near earnings
+        else:
+            vol = base_vol
+    else:
+        vol = base_vol
+
     implied_move = float(vol)
     return implied_move, spot
 
@@ -132,7 +142,7 @@ def predict_direction(clf, implied_move, sentiment, hist_move):
 # ---------- UI ----------
 def main():
     st.markdown(
-        "<h1 style='text-align: center;'>Ron's Earnings Terminal</h1>",
+        "<h1 style='text-align: center;'>Ron’s Earnings Terminal</h1>",
         unsafe_allow_html=True,
     )
 
@@ -178,7 +188,7 @@ def main():
                 st.metric("Avg Past 1D Move", f"{hist_move*100:.2f}%")
 
             if implied_move is None or spot is None:
-                st.warning("Not enough price history to estimate volatility for this ticker.")
+                st.warning("Not enough usable price history for this ticker.")
             else:
                 if predicted_move > 0.01:
                     st.success("📈 **UP bias into earnings**")
