@@ -4,6 +4,7 @@ import requests
 from textblob import TextBlob
 from sklearn.linear_model import LogisticRegression
 import numpy as np
+from datetime import date
 
 # -------------------------------
 # Load API key from Streamlit Cloud secrets
@@ -11,15 +12,21 @@ api_key = st.secrets["mp"]["api_key"]
 # -------------------------------
 
 st.set_page_config(
-    page_title="Ron's Earnings Terminal",
+    page_title="Barzin Financial Earnings Terminal",
     page_icon="📊",
     layout="wide"
 )
 
 # ---------- API ----------
-def fmp_get(url):
+BASE = "https://financialmodelingprep.com/stable"
+
+def fmp_get(path, params=None):
+    if params is None:
+        params = {}
+    params["apikey"] = api_key
+    url = f"{BASE}/{path}"
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, params=params, timeout=15)
         if r.status_code != 200:
             return None
         return r.json()
@@ -27,17 +34,17 @@ def fmp_get(url):
         return None
 
 # ---------- CORE HELPERS ----------
-def get_next_earnings_date(ticker, api_key):
-    url = f"https://financialmodelingprep.com/api/v3/earning_calendar?symbol={ticker}&limit=1&apikey={api_key}"
-    data = fmp_get(url)
+def get_next_earnings_date(ticker):
+    data = fmp_get("earning_calendar", {"symbol": ticker, "limit": 1})
     if not data:
         return None
-    return pd.to_datetime(data[0]["date"]).date()
+    try:
+        return pd.to_datetime(data[0]["date"]).date()
+    except Exception:
+        return None
 
-def get_price_history(ticker, api_key, days=120):
-    # Use full history, then trim locally to avoid FMP quirks
-    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?apikey={api_key}"
-    data = fmp_get(url)
+def get_price_history(ticker, days=365):
+    data = fmp_get("historical-price-full", {"symbol": ticker})
     if not data or "historical" not in data:
         return pd.DataFrame()
     df = pd.DataFrame(data["historical"])
@@ -45,50 +52,160 @@ def get_price_history(ticker, api_key, days=120):
     df = df.set_index("date").sort_index()
     return df.tail(days)
 
-def get_implied_move(ticker, api_key):
-    """
-    Moderate regime:
-    - 20-day realized volatility
-    - If earnings is within ~7 days, boost vol moderately
-    """
-    prices = get_price_history(ticker, api_key, days=120)
+def get_spot_from_history(ticker):
+    prices = get_price_history(ticker, days=5)
     if prices.empty:
+        return None
+    try:
+        return float(prices["close"].iloc[-1])
+    except Exception:
+        return None
+
+def get_options_chain(ticker):
+    data = fmp_get("options/chain", {"symbol": ticker})
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    # Normalize columns
+    if "expirationDate" in df.columns:
+        df["expirationDate"] = pd.to_datetime(df["expirationDate"]).dt.date
+    if "openInterest" not in df.columns:
+        df["openInterest"] = 0.0
+    return df
+
+def pick_best_expiration_by_oi(df, spot):
+    if df.empty or "expirationDate" not in df.columns:
+        return None
+    # Sum OI per expiration
+    grp = df.groupby("expirationDate")["openInterest"].sum().reset_index()
+    if grp.empty:
+        return None
+    # Sort by total OI desc, then by nearest expiration asc
+    grp = grp.sort_values(["openInterest", "expirationDate"], ascending=[False, True])
+    return grp["expirationDate"].iloc[0]
+
+def compute_implied_move_from_options(ticker):
+    """
+    Multi-strike, highest-OI expiration, nearest-exp tie-breaker.
+    """
+    chain = get_options_chain(ticker)
+    if chain.empty:
         return None, None
 
-    closes = prices["close"].astype(float)
-    if len(closes) < 20:
-        return None, float(closes.iloc[-1])
+    # Spot: try from chain, else from history
+    spot = None
+    for col in ["stockPrice", "underlyingPrice", "underlying"]:
+        if col in chain.columns:
+            try:
+                val = chain[col].dropna().iloc[0]
+                spot = float(val)
+                break
+            except Exception:
+                pass
+    if spot is None:
+        spot = get_spot_from_history(ticker)
+    if spot is None or spot <= 0:
+        return None, None
 
-    rets = closes.pct_change().dropna()
-    if rets.empty:
-        return None, float(closes.iloc[-1])
+    # Pick expiration
+    best_exp = pick_best_expiration_by_oi(chain, spot)
+    if best_exp is None:
+        return None, spot
 
-    base_vol = rets.tail(20).std()  # daily realized vol
-    spot = float(closes.iloc[-1])
+    sub = chain[chain["expirationDate"] == best_exp].copy()
+    if sub.empty:
+        return None, spot
 
-    # Earnings proximity boost
-    earn_date = get_next_earnings_date(ticker, api_key)
-    if earn_date is not None:
-        last_date = prices.index[-1].date()
-        days_to_earn = (earn_date - last_date).days
-        if 0 <= days_to_earn <= 7:
-            vol = base_vol * 1.5  # moderate boost near earnings
-        else:
-            vol = base_vol
-    else:
-        vol = base_vol
+    # Identify option type column
+    opt_col = None
+    for c in sub.columns:
+        if c.lower() in ["optiontype", "type", "side"]:
+            opt_col = c
+            break
+    if opt_col is None:
+        return None, spot
 
-    implied_move = float(vol)
+    # Filter calls/puts
+    calls = sub[sub[opt_col].str.upper().isin(["CALL", "C"])].copy()
+    puts = sub[sub[opt_col].str.upper().isin(["PUT", "P"])].copy()
+    if calls.empty or puts.empty:
+        return None, spot
+
+    # Ensure strike column
+    if "strike" not in calls.columns or "strike" not in puts.columns:
+        return None, spot
+    calls = calls[calls["strike"] > 0]
+    puts = puts[puts["strike"] > 0]
+    if calls.empty or puts.empty:
+        return None, spot
+
+    # Focus near-the-money strikes
+    calls = calls[calls["strike"].between(0.9 * spot, 1.1 * spot)]
+    puts = puts[puts["strike"].between(0.9 * spot, 1.1 * spot)]
+    if calls.empty or puts.empty:
+        return None, spot
+
+    def mid_price(row):
+        bid = None
+        ask = None
+        last = None
+        for c in row.index:
+            cl = c.lower()
+            if cl == "bid":
+                bid = row[c]
+            elif cl == "ask":
+                ask = row[c]
+            elif cl in ["last", "lastprice"]:
+                last = row[c]
+        val = 0.0
+        try:
+            if pd.notna(bid) and pd.notna(ask) and bid > 0 and ask > 0:
+                val = (bid + ask) / 2
+            elif pd.notna(last) and last > 0:
+                val = last
+        except Exception:
+            pass
+        return float(val)
+
+    calls["mid"] = calls.apply(mid_price, axis=1)
+    puts["mid"] = puts.apply(mid_price, axis=1)
+    calls = calls[calls["mid"] > 0]
+    puts = puts[puts["mid"] > 0]
+    if calls.empty or puts.empty:
+        return None, spot
+
+    call_strikes = calls["strike"].values
+    put_strikes = puts["strike"].values
+    call_mids = calls["mid"].values
+    put_mids = puts["mid"].values
+
+    pairs = []
+    for i, cs in enumerate(call_strikes):
+        j = np.argmin(np.abs(put_strikes - cs))
+        pairs.append((cs, call_mids[i], put_mids[j]))
+
+    if not pairs:
+        return None, spot
+
+    # Sort by closeness to spot, take up to 5
+    pairs = sorted(pairs, key=lambda x: abs(x[0] - spot))[:5]
+    straddle_costs = [c + p for _, c, p in pairs]
+    if not straddle_costs:
+        return None, spot
+
+    avg_straddle = float(np.mean(straddle_costs))
+    implied_move = avg_straddle / spot
     return implied_move, spot
 
-def get_simple_sentiment(ticker, api_key, limit=20):
-    url = f"https://financialmodelingprep.com/api/v3/stock_news?tickers={ticker}&limit={limit}&apikey={api_key}"
-    data = fmp_get(url)
+def get_simple_sentiment(ticker, limit=20):
+    data = fmp_get("stock_news", {"tickers": ticker, "limit": limit})
     if not data:
         return 0.0
     scores = []
     for item in data:
-        txt = item.get("title", "") + " " + item.get("text", "")
+        txt = (item.get("title", "") or "") + " " + (item.get("text", "") or "")
         if not txt.strip():
             continue
         s = TextBlob(txt).sentiment.polarity
@@ -97,19 +214,21 @@ def get_simple_sentiment(ticker, api_key, limit=20):
         return 0.0
     return float(np.mean(scores))
 
-def get_post_earnings_moves_simple(ticker, api_key, limit=10):
-    url = f"https://financialmodelingprep.com/api/v3/historical/earning_calendar/{ticker}?limit={limit}&apikey={api_key}"
-    data = fmp_get(url)
+def get_post_earnings_moves_simple(ticker, limit=10):
+    data = fmp_get("historical/earning_calendar", {"symbol": ticker, "limit": limit})
     if not data:
         return pd.DataFrame()
 
-    prices = get_price_history(ticker, api_key, days=365)
+    prices = get_price_history(ticker, days=365)
     if prices.empty:
         return pd.DataFrame()
 
     rows = []
     for e in data:
-        d0 = pd.to_datetime(e["date"])
+        try:
+            d0 = pd.to_datetime(e["date"])
+        except Exception:
+            continue
         d1 = d0 + pd.Timedelta(days=1)
         try:
             p0 = prices.loc[:d0].iloc[-1]["close"]
@@ -142,7 +261,11 @@ def predict_direction(clf, implied_move, sentiment, hist_move):
 # ---------- UI ----------
 def main():
     st.markdown(
-        "<h1 style='text-align: center;'>Ron’s Earnings Terminal</h1>",
+        "<h1 style='text-align: center;'>Barzin Financial Earnings Terminal</h1>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<p style='text-align: center; font-size: 16px; color: gray;'>Advanced Earnings Prediction Engine</p>",
         unsafe_allow_html=True,
     )
 
@@ -168,9 +291,9 @@ def main():
             st.markdown("**Tip:** Try liquid names (AAPL, MSFT, AMZN, NVDA, TSLA).")
 
         if run and ticker:
-            implied_move, spot = get_implied_move(ticker, api_key)
-            sentiment = get_simple_sentiment(ticker, api_key, limit=20)
-            hist_df = get_post_earnings_moves_simple(ticker, api_key, limit=5)
+            implied_move, spot = compute_implied_move_from_options(ticker)
+            sentiment = get_simple_sentiment(ticker, limit=20)
+            hist_df = get_post_earnings_moves_simple(ticker, limit=5)
             hist_move = hist_df["post_earnings_move_pct"].mean() if not hist_df.empty else 0.0
 
             clf = st.session_state["clf"]
@@ -188,7 +311,7 @@ def main():
                 st.metric("Avg Past 1D Move", f"{hist_move*100:.2f}%")
 
             if implied_move is None or spot is None:
-                st.warning("Not enough usable price history for this ticker.")
+                st.warning("No usable options data for this ticker/expiration. Try another symbol.")
             else:
                 if predicted_move > 0.01:
                     st.success("📈 **UP bias into earnings**")
@@ -214,7 +337,7 @@ def main():
             run_bt = st.button("Run Backtest")
 
         if run_bt and ticker_bt:
-            hist_df = get_post_earnings_moves_simple(ticker_bt, api_key, limit=10)
+            hist_df = get_post_earnings_moves_simple(ticker_bt, limit=10)
             if hist_df.empty:
                 st.warning("No historical earnings data.")
             else:
@@ -235,11 +358,11 @@ def main():
         if run_scan and universe:
             rows = []
             for t in universe:
-                implied_move, spot = get_implied_move(t, api_key)
-                sentiment = get_simple_sentiment(t, api_key, limit=10)
+                implied_move, spot = compute_implied_move_from_options(t)
+                sentiment = get_simple_sentiment(t, limit=10)
                 clf = st.session_state["clf"]
                 up_prob = predict_direction(clf, implied_move, sentiment, 0.0)
-                score = (implied_move or 0.0) * abs(2*up_prob - 1) * (1 + sentiment)
+                score = (implied_move or 0.0) * abs(2 * up_prob - 1) * (1 + sentiment)
                 rows.append({
                     "ticker": t,
                     "spot": spot,
