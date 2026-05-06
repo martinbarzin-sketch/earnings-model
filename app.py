@@ -44,7 +44,7 @@ def get_next_earnings_date(ticker):
         return None
 
 def get_price_history(ticker, days=365):
-    data = fmp_get("historical-price-full", {"symbol": ticker})
+    data = fmp_get("historical-price-eod/full", {"symbol": ticker})
     if not data or "historical" not in data:
         return pd.DataFrame()
     df = pd.DataFrame(data["historical"])
